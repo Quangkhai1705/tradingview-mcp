@@ -5,3 +5,6 @@ temp_*
 *.log
 discovery-log.json
 rules.json
+
+# [CLA] chart pin — cau hinh RIENG tung may, khong commit
+.cla-pin

@@ -1,4 +1,5 @@
 import CDP from 'chrome-remote-interface';
+import fs from 'node:fs'; // [CLA PATCH] read the chart pin file (see findChartTarget)
 
 let client = null;
 let targetInfo = null;
@@ -107,9 +108,42 @@ export async function reconnectTo(targetId) {
   return connect(targetId);
 }
 
+// [CLA PATCH] Pin the CDP target to one specific chart.
+// Why: CDP /json/list is ordered MRU, so whichever window the user last clicked jumps to index 0
+// and the agent silently follows it onto the wrong chart. Measured 3/3 times; `tab switch` does
+// NOT change the target. Pinning lets the user work freely while the agent stays on its own layout.
+// Source of the pin, first match wins:
+//   1. env  TV_PIN_CHART_ID
+//   2. file <repo>/.cla-pin   (plain text, just the chart id)
+// Empty/absent  -> original behaviour, unchanged.
+function readPinnedChartId() {
+  const fromEnv = process.env.TV_PIN_CHART_ID?.trim();
+  if (fromEnv) return fromEnv;
+  try {
+    const pinFile = new URL('../.cla-pin', import.meta.url);
+    const raw = fs.readFileSync(pinFile, 'utf8').trim();
+    return raw || null;
+  } catch {
+    return null; // no pin file -> not pinned
+  }
+}
+
 async function findChartTarget() {
   const resp = await fetch(`http://${CDP_HOST}:${CDP_PORT}/json/list`);
   const targets = await resp.json();
+
+  // [CLA PATCH] honour the pin before falling back to "first chart tab"
+  const pinned = readPinnedChartId();
+  if (pinned) {
+    const hit = targets.find(t => t.type === 'page' && t.url.includes(`/chart/${pinned}`));
+    if (hit) return hit;
+    // Pin set but that chart is gone: say so loudly instead of silently reading a random chart.
+    throw new Error(
+      `TV pin set to chart "${pinned}" but no open tab matches it. `
+      + `Open that chart, or clear the pin (env TV_PIN_CHART_ID / file .cla-pin).`
+    );
+  }
+
   // Prefer targets with tradingview.com/chart in the URL
   return targets.find(t => t.type === 'page' && /tradingview\.com\/chart/i.test(t.url))
     || targets.find(t => t.type === 'page' && /tradingview/i.test(t.url))

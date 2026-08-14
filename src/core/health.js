@@ -5,6 +5,7 @@ import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../conne
 import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { dirname, basename, join } from 'path';
+import { fileURLToPath } from 'url';
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -233,6 +234,31 @@ function _spawnDetached(spawnFn, exe, args) {
   return child;
 }
 
+/**
+ * On Windows MSIX installs spawn() throws EPERM *synchronously* (not as an 'error'
+ * event), which aborted launch() before the fallback below could run. Swallow it so
+ * the caller can fall through to the MSIX paths. Measured 2026-08-14, Win10 19045.
+ */
+function _trySpawnDetached(spawnFn, exe, args) {
+  try { return _spawnDetached(spawnFn, exe, args); }
+  catch { return null; }
+}
+
+/**
+ * Launch through the MSIX package context. Needed because BOTH other Windows paths
+ * fail on a Store install: a direct WindowsApps spawn is EPERM, and a local copy of
+ * the package (see _copyMsixPackageLocal) starts and exits at once — it has lost its
+ * package identity. Invoke-CommandInDesktopPackage keeps identity and still passes
+ * the CDP flag. Returns true if PowerShell accepted the command.
+ */
+function _launchViaPackageContext(execSync, cdpPort) {
+  const script = join(dirname(dirname(dirname(fileURLToPath(import.meta.url)))), 'scripts', 'launch_tv_msix.ps1');
+  try {
+    execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${script}" ${cdpPort}`, { timeout: 90000 });
+    return true;
+  } catch { return false; }
+}
+
 // Resolves once with an error string if the process fails/exits within graceMs,
 // or with null if it survives that long.
 function _spawnFailedEarly(child, graceMs = 1500) {
@@ -360,21 +386,30 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   if (killFirst) await killExisting();
 
   const cdpArgs = [`--remote-debugging-port=${cdpPort}`];
-  let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
+  let child = _trySpawnDetached(deps.spawn, tvPath, cdpArgs);
   let info = null;
   let usedLocalCopy = false;
+  let usedPackageContext = false;
 
   if (platform === 'win32' && WINDOWS_APPS_RE.test(tvPath)) {
-    const earlyFailure = await _spawnFailedEarly(child);
+    const earlyFailure = child ? await _spawnFailedEarly(child) : 'spawn EPERM';
     if (!earlyFailure) {
       info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
     }
     if (!info) {
-      // Direct WindowsApps launch was blocked or CDP never bound — fall back to
-      // a local copy of the package (see _copyMsixPackageLocal).
+      // Direct WindowsApps launch was blocked or CDP never bound. Try the package
+      // context first: it is cheap and keeps MSIX identity, whereas the local copy
+      // costs a 330MB copy and then exits immediately on builds that check identity.
+      if (_launchViaPackageContext(deps.execSync, cdpPort)) {
+        usedPackageContext = true;
+        info = await _waitForCdp({ cdpPort, attempts: 5, delay: deps.delay, probeCdp: deps.probeCdp });
+      }
+    }
+    if (!info) {
+      // Last resort — a local copy of the package (see _copyMsixPackageLocal).
       const localExe = _copyMsixPackageLocal(tvPath, deps);
       await killExisting();
-      child = _spawnDetached(deps.spawn, localExe, cdpArgs);
+      child = _trySpawnDetached(deps.spawn, localExe, cdpArgs);
       tvPath = localExe;
       usedLocalCopy = true;
     }
@@ -384,18 +419,21 @@ export async function launch({ port, kill_existing, _deps } = {}) {
     info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
   }
 
+  // child is null when spawn threw EPERM and the package-context path took over.
   if (info) {
     return {
-      success: true, platform, binary: tvPath, pid: child.pid,
+      success: true, platform, binary: tvPath, pid: child?.pid ?? null,
       cdp_port: cdpPort, cdp_url: `http://${CDP_HOST}:${cdpPort}`,
       browser: info.Browser, user_agent: info['User-Agent'],
       ...(usedLocalCopy && { msix_local_copy: true }),
+      ...(usedPackageContext && { msix_package_context: true }),
     };
   }
 
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: true, platform, binary: tvPath, pid: child?.pid ?? null, cdp_port: cdpPort, cdp_ready: false,
     ...(usedLocalCopy && { msix_local_copy: true }),
+    ...(usedPackageContext && { msix_package_context: true }),
     warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
   };
 }
